@@ -1,13 +1,13 @@
+import os
 import sys
+import ctypes
 import pymupdf
 from PySide6.QtCore import Qt, QRect, QPoint, Signal
-from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QAction
+from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
-    QWidget,
     QVBoxLayout,
-    QHBoxLayout,
     QToolBar,
     QLabel,
     QScrollArea,
@@ -22,10 +22,15 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QDialog,
 )
-from PySide6.QtGui import QIcon
 
 from pdf_engine import PDFEngine
 from ui_dialogs import SignatureDialog, SplitDialog, EncryptDialog
+
+
+def get_icon_path() -> str:
+    """Finds icon.png in the same folder as main.py."""
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, "icon.png")
 
 
 class InteractivePDFCanvas(QLabel):
@@ -37,7 +42,7 @@ class InteractivePDFCanvas(QLabel):
         super().__init__()
         self.engine = engine
         self.page_num = 0
-        self.tool_mode = "pan"  # pan | highlight | note | text | ink | sign
+        self.tool_mode = "pan"
         self.pending_sig_path: str | None = None
         self.search_rects: list[pymupdf.Rect] = []
 
@@ -127,14 +132,12 @@ class InteractivePDFCanvas(QLabel):
         painter = QPainter(self)
         z = self.engine.zoom
 
-        # Highlight search matches
         if self.search_rects:
             painter.setBrush(QColor(255, 235, 59, 110))
             painter.setPen(QPen(QColor(245, 158, 11), 2))
             for r in self.search_rects:
                 painter.drawRect(QRect(int(r.x0 * z), int(r.y0 * z), int(r.width * z), int(r.height * z)))
 
-        # Live selection preview while dragging
         if self.drag_start and self.drag_curr:
             if self.tool_mode == "highlight":
                 painter.setBrush(QColor(255, 235, 59, 90))
@@ -154,6 +157,11 @@ class OpenAcrobatWindow(QMainWindow):
         self.setWindowTitle("OpenAcrobat - Free & Open-Source PDF Reader & Editor")
         self.resize(1360, 860)
 
+        # Load your custom bird app icon
+        icon_file = get_icon_path()
+        if os.path.exists(icon_file):
+            self.setWindowIcon(QIcon(icon_file))
+
         self.engine = PDFEngine()
         self.current_page = 0
         self.search_hits: dict[int, list[pymupdf.Rect]] = {}
@@ -164,14 +172,12 @@ class OpenAcrobatWindow(QMainWindow):
     def _build_ui(self):
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left Thumbnail Sidebar
         self.thumb_list = QListWidget()
         self.thumb_list.setMaximumWidth(190)
         self.thumb_list.setIconSize(QPixmap(130, 170).size())
         self.thumb_list.currentRowChanged.connect(self._on_thumbnail_selected)
         splitter.addWidget(self.thumb_list)
 
-        # Center Scrollable PDF Viewport
         self.canvas = InteractivePDFCanvas(self.engine)
         self.canvas.annotation_added.connect(self.refresh_view)
 
@@ -189,13 +195,11 @@ class OpenAcrobatWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        # File Operations
         self._add_action(tb, "Open", self.open_file)
         self._add_action(tb, "Save", self.save_file)
         self._add_action(tb, "Save As", self.save_file_as)
         tb.addSeparator()
 
-        # Navigation & Zoom
         self._add_action(tb, "Prev", lambda: self.go_to_page(self.current_page - 1))
         self.page_label = QLabel(" Page 0 / 0 ")
         tb.addWidget(self.page_label)
@@ -205,7 +209,6 @@ class OpenAcrobatWindow(QMainWindow):
         self._add_action(tb, "Dark Mode", self.toggle_dark_mode)
         tb.addSeparator()
 
-        # Annotate & Fill/Sign
         self._add_action(tb, "Pan", lambda: self.set_mode("pan"))
         self._add_action(tb, "Highlight", lambda: self.set_mode("highlight"))
         self._add_action(tb, "Sticky Note", lambda: self.set_mode("note"))
@@ -215,7 +218,6 @@ class OpenAcrobatWindow(QMainWindow):
         self._add_action(tb, "Clear Annots", self.clear_annots)
         tb.addSeparator()
 
-        # Search Bar
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search PDF...")
         self.search_input.setMaximumWidth(170)
@@ -225,7 +227,6 @@ class OpenAcrobatWindow(QMainWindow):
         btn_search.clicked.connect(self.run_search)
         tb.addWidget(btn_search)
 
-        # Top Menu Bar (Pro Tools: Organize, Convert, Compress, Protect, OCR, Read Aloud)
         menubar = self.menuBar()
 
         org_menu = menubar.addMenu("Organize Pages")
@@ -254,8 +255,6 @@ class OpenAcrobatWindow(QMainWindow):
         act = QAction(label, self)
         act.triggered.connect(slot)
         toolbar.addAction(act)
-
-    # -------------------- VIEW & NAVIGATION --------------------
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
@@ -352,8 +351,6 @@ class OpenAcrobatWindow(QMainWindow):
                 self, "Search", f"Found {total_matches} matches across {len(self.search_hits)} pages."
             )
 
-    # -------------------- ANNOTATIONS & SIGNING --------------------
-
     def start_sign_mode(self):
         if not self.engine.doc:
             return
@@ -380,8 +377,6 @@ class OpenAcrobatWindow(QMainWindow):
         if out:
             self.engine.save_pdf(out)
             QMessageBox.information(self, "Saved", f"Saved to {out}")
-
-    # -------------------- PRO TOOLS --------------------
 
     def rotate_current_page(self):
         if self.engine.doc:
@@ -488,7 +483,15 @@ class OpenAcrobatWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpenAcrobat.PDFReader.1.0")
+
     app = QApplication(sys.argv)
+
+    icon_file = get_icon_path()
+    if os.path.exists(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
+
     window = OpenAcrobatWindow()
     window.show()
     sys.exit(app.exec())
