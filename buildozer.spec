@@ -5,7 +5,7 @@ package.domain = org.antechreader
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 1.0
-requirements = python3,kivy==2.3.0,pyjnius,pillow,pypdf,fpdf2
+requirements = python3,kivy==2.3.0,android,pyjnius,pillow,pypdf,fpdf2,defusedxml,fonttools
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/icon.png
 orientation = portrait
