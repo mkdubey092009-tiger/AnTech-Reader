@@ -1,497 +1,697 @@
+import io
 import os
-import sys
-import ctypes
-import pymupdf
-from PySide6.QtCore import Qt, QRect, QPoint, Signal
-from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QAction, QIcon
-from PySide6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QVBoxLayout,
-    QToolBar,
-    QLabel,
-    QScrollArea,
-    QListWidget,
-    QListWidgetItem,
-    QFileDialog,
-    QInputDialog,
-    QMessageBox,
-    QLineEdit,
-    QPushButton,
-    QSplitter,
-    QTextEdit,
-    QDialog,
-)
+import time
+from PIL import Image as PILImage
+from fpdf import FPDF
+from pypdf import PdfReader, PdfWriter
 
-from pdf_engine import PDFEngine
-from ui_dialogs import SignatureDialog, SplitDialog, EncryptDialog
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.core.image import Image as CoreImage
+from kivy.graphics import Color, Line, Rectangle
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.image import Image
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
+from kivy.utils import platform
+
+REQ_OPEN_PDF = 1001
+REQ_MERGE_PDFS = 1002
+REQ_IMAGES_TO_PDF = 1003
+
+if platform == "android":
+    from android import activity
+    from android.permissions import Permission, request_permissions
+    from jnius import autoclass
+
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    Intent = autoclass("android.content.Intent")
+    File = autoclass("java.io.File")
+    ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
+    PdfRenderer = autoclass("android.graphics.pdf.PdfRenderer")
+    Bitmap = autoclass("android.graphics.Bitmap")
+    BitmapConfig = autoclass("android.graphics.Bitmap$Config")
+    Canvas = autoclass("android.graphics.Canvas")
+    AndroidColor = autoclass("android.graphics.Color")
+    ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
+    CompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
+    Environment = autoclass("android.os.Environment")
+    TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+    Locale = autoclass("java.util.Locale")
 
 
-def get_icon_path() -> str:
-    """Finds icon.png in the same folder as main.py."""
-    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_dir, "icon.png")
+class SignaturePad(Widget):
+    """Touch pad for drawing signatures on Android."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.strokes = []
+        self.current_line = None
+        with self.canvas.before:
+            Color(1, 1, 1, 1)
+            self.bg = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._update_bg, size=self._update_bg)
+
+    def _update_bg(self, *_):
+        self.bg.pos = self.pos
+        self.bg.size = self.size
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+        with self.canvas:
+            Color(0.06, 0.09, 0.16, 1)
+            self.current_line = Line(points=[touch.x, touch.y], width=2.5)
+        self.strokes.append(self.current_line)
+        return True
+
+    def on_touch_move(self, touch):
+        if self.current_line and self.collide_point(*touch.pos):
+            self.current_line.points += [touch.x, touch.y]
+            return True
+        return False
+
+    def clear_pad(self):
+        self.canvas.clear()
+        self.strokes.clear()
+        with self.canvas.before:
+            Color(1, 1, 1, 1)
+            self.bg = Rectangle(pos=self.pos, size=self.size)
 
 
-class InteractivePDFCanvas(QLabel):
-    """Interactive PDF viewport supporting drag-highlight, ink drawing, notes, text, and signatures."""
+class PDFPageCanvas(Image):
+    """Interactive PDF page view supporting Highlight, Text, Ink Draw, and Signature placement."""
 
-    annotation_added = Signal()
+    def __init__(self, app_ref, **kwargs):
+        super().__init__(**kwargs)
+        self.app_ref = app_ref
+        self.allow_stretch = True
+        self.keep_ratio = True
+        self.start_pt = None
+        self.ink_pts = []
+        self.preview_line = None
+        self.preview_rect = None
 
-    def __init__(self, engine: PDFEngine):
-        super().__init__()
-        self.engine = engine
-        self.page_num = 0
+    def _widget_to_norm(self, x, y):
+        if self.width <= 0 or self.height <= 0:
+            return 0.0, 0.0
+        nx = max(0.0, min(1.0, (x - self.x) / self.width))
+        ny = max(0.0, min(1.0, 1.0 - ((y - self.y) / self.height)))
+        return nx, ny
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return super().on_touch_down(touch)
+
+        mode = self.app_ref.tool_mode
+        if mode == "pan":
+            return super().on_touch_down(touch)
+
+        nx, ny = self._widget_to_norm(touch.x, touch.y)
+
+        if mode == "text":
+            self.app_ref.prompt_add_text(nx, ny)
+            return True
+
+        if mode == "sign" and self.app_ref.sig_png_path:
+            self.app_ref.apply_signature_at(nx, ny)
+            return True
+
+        self.start_pt = (touch.x, touch.y)
+        self.ink_pts = [(nx, ny)]
+
+        if mode == "draw":
+            with self.canvas.after:
+                Color(0.86, 0.15, 0.15, 1)
+                self.preview_line = Line(points=[touch.x, touch.y], width=2.2)
+        elif mode == "highlight":
+            with self.canvas.after:
+                Color(1, 0.92, 0.23, 0.45)
+                self.preview_rect = Rectangle(pos=(touch.x, touch.y), size=(1, 1))
+        return True
+
+    def on_touch_move(self, touch):
+        if not self.start_pt:
+            return super().on_touch_move(touch)
+
+        mode = self.app_ref.tool_mode
+        nx, ny = self._widget_to_norm(touch.x, touch.y)
+
+        if mode == "draw" and self.preview_line:
+            self.preview_line.points += [touch.x, touch.y]
+            self.ink_pts.append((nx, ny))
+        elif mode == "highlight" and self.preview_rect:
+            x0, y0 = self.start_pt
+            self.preview_rect.pos = (min(x0, touch.x), min(y0, touch.y))
+            self.preview_rect.size = (abs(touch.x - x0), abs(touch.y - y0))
+        return True
+
+    def on_touch_up(self, touch):
+        if not self.start_pt:
+            return super().on_touch_up(touch)
+
+        mode = self.app_ref.tool_mode
+        self.canvas.after.clear()
+
+        if mode == "draw" and len(self.ink_pts) > 1:
+            self.app_ref.apply_ink_strokes(self.ink_pts)
+        elif mode == "highlight":
+            nx1, ny1 = self._widget_to_norm(*self.start_pt)
+            nx2, ny2 = self._widget_to_norm(touch.x, touch.y)
+            self.app_ref.apply_highlight_box(nx1, ny1, nx2, ny2)
+
+        self.start_pt = None
+        self.ink_pts = []
+        self.preview_line = None
+        self.preview_rect = None
+        return True
+
+
+class OpenAcrobatApp(App):
+    def build(self):
+        self.title = "OpenAcrobat"
+        self.icon = "icon.png"
+        self.current_pdf = None
+        self.current_page = 0
+        self.total_pages = 0
+        self.zoom = 1.5
+        self.dark_mode = False
         self.tool_mode = "pan"
-        self.pending_sig_path: str | None = None
-        self.search_rects: list[pymupdf.Rect] = []
+        self.sig_png_path = None
+        self.tts = None
 
-        self.drag_start: QPoint | None = None
-        self.drag_curr: QPoint | None = None
-        self.ink_points: list[tuple[float, float]] = []
+        if platform == "android":
+            request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
+            activity.bind(on_activity_result=self.on_activity_result)
+            self.tts = TextToSpeech(PythonActivity.mActivity, None)
 
-        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.setMouseTracking(True)
+        root = BoxLayout(orientation="vertical", spacing=4, padding=6)
 
-    def _to_pdf_point(self, pt: QPoint) -> pymupdf.Point:
-        z = self.engine.zoom
-        return pymupdf.Point(pt.x() / z, pt.y() / z)
+        # Top Action Bar
+        top_bar = GridLayout(cols=6, size_hint_y=None, height=46, spacing=4)
+        top_bar.add_widget(Button(text="Open", background_color=(0.15, 0.39, 0.92, 1), on_release=lambda *_: self.pick_single_pdf()))
+        top_bar.add_widget(Button(text="Save", on_release=lambda *_: self.save_to_downloads()))
+        top_bar.add_widget(Button(text="Prev", on_release=lambda *_: self.change_page(-1)))
+        self.page_lbl = Label(text="1 / 1", size_hint_x=0.8)
+        top_bar.add_widget(self.page_lbl)
+        top_bar.add_widget(Button(text="Next", on_release=lambda *_: self.change_page(1)))
+        top_bar.add_widget(Button(text="Dark", on_release=lambda *_: self.toggle_dark_mode()))
+        root.add_widget(top_bar)
 
-    def _to_pdf_rect(self, p1: QPoint, p2: QPoint) -> pymupdf.Rect:
-        z = self.engine.zoom
-        x0, x1 = sorted([p1.x() / z, p2.x() / z])
-        y0, y1 = sorted([p1.y() / z, p2.y() / z])
-        return pymupdf.Rect(x0, y0, x1, y1)
+        # Scrollable Tool Strip (All Acrobat Features)
+        tool_scroll = ScrollView(size_hint_y=None, height=46, do_scroll_y=False)
+        tool_bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=4)
+        tool_bar.bind(minimum_width=tool_bar.setter("width"))
 
-    def mousePressEvent(self, event):
-        if not self.engine.doc or event.button() != Qt.LeftButton:
+        tools = [
+            ("Pan", lambda *_: self.set_mode("pan")),
+            ("Highlight", lambda *_: self.set_mode("highlight")),
+            ("Add Text", lambda *_: self.set_mode("text")),
+            ("Draw", lambda *_: self.set_mode("draw")),
+            ("Fill & Sign", lambda *_: self.open_signature_dialog()),
+            ("Zoom +", lambda *_: self.change_zoom(0.3)),
+            ("Zoom -", lambda *_: self.change_zoom(-0.3)),
+            ("Rotate 90°", lambda *_: self.rotate_page()),
+            ("Delete Pg", lambda *_: self.delete_page()),
+            ("Merge PDFs", lambda *_: self.pick_merge_pdfs()),
+            ("Split PDF", lambda *_: self.open_split_dialog()),
+            ("Img -> PDF", lambda *_: self.pick_images_to_pdf()),
+            ("Protect", lambda *_: self.open_encrypt_dialog()),
+            ("Read Aloud", lambda *_: self.read_aloud()),
+            ("Search", lambda *_: self.open_search_dialog()),
+        ]
+        for label, cb in tools:
+            btn = Button(text=label, size_hint_x=None, width=96)
+            btn.bind(on_release=cb)
+            tool_bar.add_widget(btn)
+
+        tool_scroll.add_widget(tool_bar)
+        root.add_widget(tool_scroll)
+
+        # Center PDF Viewport
+        self.viewer_scroll = ScrollView()
+        self.pdf_view = PDFPageCanvas(self, size_hint=(None, None))
+        self.viewer_scroll.add_widget(self.pdf_view)
+        root.add_widget(self.viewer_scroll)
+
+        # Status Bar
+        self.status_lbl = Label(text="Ready - Tap Open to load any PDF", size_hint_y=None, height=28, font_size="12sp")
+        root.add_widget(self.status_lbl)
+
+        Clock.schedule_once(lambda *_: self._create_welcome_pdf(), 0.2)
+        return root
+
+    def _create_welcome_pdf(self):
+        os.makedirs(self.user_data_dir, exist_ok=True)
+        sample_path = os.path.join(self.user_data_dir, "welcome.pdf")
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.cell(0, 16, "OpenAcrobat for Android", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", size=13)
+        pdf.multi_cell(
+            0,
+            9,
+            "Tap 'Open' at the top-left to load any PDF from your phone.\n"
+            "You can Highlight, Add Text, Draw, Fill & Sign, Rotate, Merge, Split, "
+            "Convert Images to PDF, Password Protect, and Read Aloud!",
+        )
+        pdf.output(sample_path)
+        self.load_pdf(sample_path)
+
+    # -------------------- RENDERING --------------------
+
+    def load_pdf(self, path):
+        try:
+            reader = PdfReader(path)
+            if reader.is_encrypted:
+                self.prompt_password_and_decrypt(path)
+                return
+            self.current_pdf = path
+            self.total_pages = len(reader.pages)
+            self.current_page = max(0, min(self.current_page, self.total_pages - 1))
+            self.render_current_page()
+        except Exception as e:
+            self.status_lbl.text = f"Error: {e}"
+
+    def render_current_page(self):
+        if not self.current_pdf:
             return
-        pos = event.position().toPoint()
+        self.page_lbl.text = f"{self.current_page + 1} / {self.total_pages}"
 
-        if self.tool_mode == "note":
-            text, ok = QInputDialog.getMultiLineText(self, "Sticky Note", "Comment:")
-            if ok and text.strip():
-                self.engine.add_sticky_note(self.page_num, self._to_pdf_point(pos), text)
-                self.annotation_added.emit()
+        if platform == "android":
+            java_file = File(self.current_pdf)
+            pfd = ParcelFileDescriptor.open(java_file, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd)
+            page = renderer.openPage(self.current_page)
+            w = max(200, int(page.getWidth() * self.zoom))
+            h = max(200, int(page.getHeight() * self.zoom))
+            bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
+            canvas = Canvas(bitmap)
+            canvas.drawColor(AndroidColor.WHITE)
+            page.render(bitmap, None, None, 1)
+            page.close()
+            renderer.close()
+            pfd.close()
 
-        elif self.tool_mode == "text":
-            text, ok = QInputDialog.getText(self, "Add Text", "Enter text to insert:")
-            if ok and text.strip():
-                pt = self._to_pdf_point(pos)
-                rect = pymupdf.Rect(pt.x, pt.y, pt.x + 220, pt.y + 40)
-                self.engine.add_freetext(self.page_num, rect, text)
-                self.annotation_added.emit()
+            baos = ByteArrayOutputStream()
+            bitmap.compress(CompressFormat.PNG, 100, baos)
+            png_bytes = bytes(b & 0xFF for b in baos.toByteArray())
 
-        elif self.tool_mode == "sign" and self.pending_sig_path:
-            pt = self._to_pdf_point(pos)
-            rect = pymupdf.Rect(pt.x, pt.y, pt.x + 150, pt.y + 60)
-            self.engine.insert_signature(self.page_num, rect, self.pending_sig_path)
-            self.tool_mode = "pan"
-            self.annotation_added.emit()
+            if self.dark_mode:
+                im = PILImage.open(io.BytesIO(png_bytes)).convert("RGB")
+                im = PILImage.eval(im, lambda px: 255 - px)
+                out_buf = io.BytesIO()
+                im.save(out_buf, format="PNG")
+                png_bytes = out_buf.getvalue()
 
-        elif self.tool_mode in ("highlight", "ink"):
-            self.drag_start = pos
-            self.drag_curr = pos
-            if self.tool_mode == "ink":
-                pt = self._to_pdf_point(pos)
-                self.ink_points = [(pt.x, pt.y)]
+            tex = CoreImage(io.BytesIO(png_bytes), ext="png").texture
+            self.pdf_view.texture = tex
+            self.pdf_view.size = (w, h)
+        else:
+            self.pdf_view.size = (600, 800)
 
-    def mouseMoveEvent(self, event):
-        if self.drag_start is None:
+    def change_page(self, delta):
+        if not self.current_pdf:
             return
-        pos = event.position().toPoint()
-        self.drag_curr = pos
-        if self.tool_mode == "ink":
-            pt = self._to_pdf_point(pos)
-            self.ink_points.append((pt.x, pt.y))
-        self.update()
+        new_p = self.current_page + delta
+        if 0 <= new_p < self.total_pages:
+            self.current_page = new_p
+            self.render_current_page()
 
-    def mouseReleaseEvent(self, event):
-        if self.drag_start is None or event.button() != Qt.LeftButton:
-            return
-        end_pos = event.position().toPoint()
-
-        if self.tool_mode == "highlight":
-            rect = self._to_pdf_rect(self.drag_start, end_pos)
-            if rect.width > 3 and rect.height > 3:
-                self.engine.add_highlight(self.page_num, rect)
-                self.annotation_added.emit()
-
-        elif self.tool_mode == "ink":
-            if len(self.ink_points) > 1:
-                self.engine.add_ink_drawing(self.page_num, self.ink_points)
-                self.annotation_added.emit()
-
-        self.drag_start = None
-        self.drag_curr = None
-        self.ink_points = []
-        self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        z = self.engine.zoom
-
-        if self.search_rects:
-            painter.setBrush(QColor(255, 235, 59, 110))
-            painter.setPen(QPen(QColor(245, 158, 11), 2))
-            for r in self.search_rects:
-                painter.drawRect(QRect(int(r.x0 * z), int(r.y0 * z), int(r.width * z), int(r.height * z)))
-
-        if self.drag_start and self.drag_curr:
-            if self.tool_mode == "highlight":
-                painter.setBrush(QColor(255, 235, 59, 90))
-                painter.setPen(QPen(QColor(234, 179, 8), 1, Qt.DashLine))
-                painter.drawRect(QRect(self.drag_start, self.drag_curr).normalized())
-            elif self.tool_mode == "ink" and len(self.ink_points) > 1:
-                painter.setPen(QPen(QColor(220, 38, 38), 2.5))
-                for i in range(1, len(self.ink_points)):
-                    p1 = QPoint(int(self.ink_points[i - 1][0] * z), int(self.ink_points[i - 1][1] * z))
-                    p2 = QPoint(int(self.ink_points[i][0] * z), int(self.ink_points[i][1] * z))
-                    painter.drawLine(p1, p2)
-
-
-class OpenAcrobatWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("OpenAcrobat - Free & Open-Source PDF Reader & Editor")
-        self.resize(1360, 860)
-
-        # Load your custom bird app icon
-        icon_file = get_icon_path()
-        if os.path.exists(icon_file):
-            self.setWindowIcon(QIcon(icon_file))
-
-        self.engine = PDFEngine()
-        self.current_page = 0
-        self.search_hits: dict[int, list[pymupdf.Rect]] = {}
-
-        self._build_ui()
-        self._build_menus_and_toolbar()
-
-    def _build_ui(self):
-        splitter = QSplitter(Qt.Horizontal)
-
-        self.thumb_list = QListWidget()
-        self.thumb_list.setMaximumWidth(190)
-        self.thumb_list.setIconSize(QPixmap(130, 170).size())
-        self.thumb_list.currentRowChanged.connect(self._on_thumbnail_selected)
-        splitter.addWidget(self.thumb_list)
-
-        self.canvas = InteractivePDFCanvas(self.engine)
-        self.canvas.annotation_added.connect(self.refresh_view)
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidget(self.canvas)
-        self.scroll_area.setAlignment(Qt.AlignCenter)
-        self.scroll_area.setStyleSheet("background-color: #1e293b;")
-        splitter.addWidget(self.scroll_area)
-
-        splitter.setSizes([180, 1180])
-        self.setCentralWidget(splitter)
-
-    def _build_menus_and_toolbar(self):
-        tb = QToolBar("Main Toolbar")
-        tb.setMovable(False)
-        self.addToolBar(tb)
-
-        self._add_action(tb, "Open", self.open_file)
-        self._add_action(tb, "Save", self.save_file)
-        self._add_action(tb, "Save As", self.save_file_as)
-        tb.addSeparator()
-
-        self._add_action(tb, "Prev", lambda: self.go_to_page(self.current_page - 1))
-        self.page_label = QLabel(" Page 0 / 0 ")
-        tb.addWidget(self.page_label)
-        self._add_action(tb, "Next", lambda: self.go_to_page(self.current_page + 1))
-        self._add_action(tb, "Zoom -", lambda: self.change_zoom(-0.2))
-        self._add_action(tb, "Zoom +", lambda: self.change_zoom(0.2))
-        self._add_action(tb, "Dark Mode", self.toggle_dark_mode)
-        tb.addSeparator()
-
-        self._add_action(tb, "Pan", lambda: self.set_mode("pan"))
-        self._add_action(tb, "Highlight", lambda: self.set_mode("highlight"))
-        self._add_action(tb, "Sticky Note", lambda: self.set_mode("note"))
-        self._add_action(tb, "Add Text", lambda: self.set_mode("text"))
-        self._add_action(tb, "Draw", lambda: self.set_mode("ink"))
-        self._add_action(tb, "Fill & Sign", self.start_sign_mode)
-        self._add_action(tb, "Clear Annots", self.clear_annots)
-        tb.addSeparator()
-
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search PDF...")
-        self.search_input.setMaximumWidth(170)
-        self.search_input.returnPressed.connect(self.run_search)
-        tb.addWidget(self.search_input)
-        btn_search = QPushButton("Find")
-        btn_search.clicked.connect(self.run_search)
-        tb.addWidget(btn_search)
-
-        menubar = self.menuBar()
-
-        org_menu = menubar.addMenu("Organize Pages")
-        org_menu.addAction("Rotate Page 90° CW", self.rotate_current_page)
-        org_menu.addAction("Move Page Up", lambda: self.move_current_page(-1))
-        org_menu.addAction("Move Page Down", lambda: self.move_current_page(1))
-        org_menu.addAction("Delete Current Page", self.delete_current_page)
-        org_menu.addSeparator()
-        org_menu.addAction("Merge Multiple PDFs...", self.merge_pdfs)
-        org_menu.addAction("Split / Extract Page Range...", self.split_pdf)
-
-        conv_menu = menubar.addMenu("Convert & Create")
-        conv_menu.addAction("Export PDF to Word (.docx)...", self.export_word)
-        conv_menu.addAction("Export PDF Pages to PNG Images...", self.export_images)
-        conv_menu.addAction("Create PDF from Images...", self.create_pdf_from_images)
-
-        sec_menu = menubar.addMenu("Optimize & Security")
-        sec_menu.addAction("Compress PDF Size...", self.compress_pdf)
-        sec_menu.addAction("Password Protect PDF (AES-256)...", self.encrypt_pdf)
-
-        ai_menu = menubar.addMenu("Accessibility & OCR")
-        ai_menu.addAction("Read Current Page Aloud (TTS)", self.read_aloud)
-        ai_menu.addAction("Extract Text / Run OCR on Page", self.show_ocr_text)
-
-    def _add_action(self, toolbar: QToolBar, label: str, slot):
-        act = QAction(label, self)
-        act.triggered.connect(slot)
-        toolbar.addAction(act)
-
-    def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
-        if not path:
-            return
-        ok, msg = self.engine.open_pdf(path)
-        if not ok and msg == "PASSWORD_REQUIRED":
-            pw, accepted = QInputDialog.getText(
-                self, "Encrypted PDF", "Enter PDF password:", QLineEdit.Password
-            )
-            if accepted:
-                ok, msg = self.engine.open_pdf(path, pw)
-        if not ok:
-            QMessageBox.critical(self, "Error", f"Could not open PDF:\n{msg}")
-            return
-
-        self.current_page = 0
-        self.search_hits.clear()
-        self.populate_thumbnails()
-        self.refresh_view()
-
-    def populate_thumbnails(self):
-        self.thumb_list.blockSignals(True)
-        self.thumb_list.clear()
-        if self.engine.doc:
-            for i in range(len(self.engine.doc)):
-                png = self.engine.render_thumbnail(i)
-                pix = QPixmap()
-                pix.loadFromData(png)
-                item = QListWidgetItem(QIcon(pix), f"Page {i + 1}")
-                self.thumb_list.addItem(item)
-            self.thumb_list.setCurrentRow(self.current_page)
-        self.thumb_list.blockSignals(False)
-
-    def refresh_view(self):
-        if not self.engine.doc:
-            return
-        total = len(self.engine.doc)
-        self.current_page = max(0, min(self.current_page, total - 1))
-        self.canvas.page_num = self.current_page
-        self.canvas.search_rects = self.search_hits.get(self.current_page, [])
-
-        png_data = self.engine.render_page(self.current_page)
-        if png_data:
-            pix = QPixmap()
-            pix.loadFromData(png_data)
-            self.canvas.setPixmap(pix)
-            self.canvas.setFixedSize(pix.size())
-
-        self.page_label.setText(f" Page {self.current_page + 1} / {total} ")
-        self.thumb_list.blockSignals(True)
-        self.thumb_list.setCurrentRow(self.current_page)
-        self.thumb_list.blockSignals(False)
-
-    def _on_thumbnail_selected(self, row: int):
-        if row >= 0:
-            self.go_to_page(row)
-
-    def go_to_page(self, page_num: int):
-        if self.engine.doc and 0 <= page_num < len(self.engine.doc):
-            self.current_page = page_num
-            self.refresh_view()
-
-    def change_zoom(self, delta: float):
-        self.engine.zoom = max(0.4, min(4.0, self.engine.zoom + delta))
-        self.refresh_view()
+    def change_zoom(self, delta):
+        self.zoom = max(0.7, min(3.5, self.zoom + delta))
+        self.render_current_page()
 
     def toggle_dark_mode(self):
-        self.engine.dark_mode = not self.engine.dark_mode
-        self.refresh_view()
+        self.dark_mode = not self.dark_mode
+        self.render_current_page()
 
-    def set_mode(self, mode: str):
-        self.canvas.tool_mode = mode
-        cursors = {
-            "pan": Qt.ArrowCursor,
-            "highlight": Qt.CrossCursor,
-            "note": Qt.PointingHandCursor,
-            "text": Qt.IBeamCursor,
-            "ink": Qt.CrossCursor,
-            "sign": Qt.PointingHandCursor,
-        }
-        self.canvas.setCursor(cursors.get(mode, Qt.ArrowCursor))
+    def set_mode(self, mode):
+        self.tool_mode = mode
+        self.status_lbl.text = f"Active tool: {mode.upper()}"
 
-    def run_search(self):
-        query = self.search_input.text().strip()
-        self.search_hits = self.engine.search_text(query)
-        if not self.search_hits:
-            QMessageBox.information(self, "Search", "No matches found.")
-        else:
-            first_page = sorted(self.search_hits.keys())[0]
-            total_matches = sum(len(v) for v in self.search_hits.values())
-            self.go_to_page(first_page)
-            QMessageBox.information(
-                self, "Search", f"Found {total_matches} matches across {len(self.search_hits)} pages."
-            )
+    # -------------------- ANNOTATIONS & SIGNING --------------------
 
-    def start_sign_mode(self):
-        if not self.engine.doc:
+    def _merge_fpdf_overlay(self, draw_callback):
+        if not self.current_pdf:
             return
-        dlg = SignatureDialog(self)
-        if dlg.exec() and dlg.sig_path:
-            self.canvas.pending_sig_path = dlg.sig_path
+        reader = PdfReader(self.current_pdf)
+        page = reader.pages[self.current_page]
+        pw, ph = float(page.mediabox.width), float(page.mediabox.height)
+
+        overlay_pdf = os.path.join(self.user_data_dir, "overlay.pdf")
+        fpdf = FPDF(unit="pt", format=(pw, ph))
+        fpdf.add_page()
+        draw_callback(fpdf, pw, ph)
+        fpdf.output(overlay_pdf)
+
+        overlay_reader = PdfReader(overlay_pdf)
+        writer = PdfWriter()
+        for idx, p in enumerate(reader.pages):
+            if idx == self.current_page:
+                p.merge_page(overlay_reader.pages[0])
+            writer.add_page(p)
+
+        updated_path = os.path.join(self.user_data_dir, f"edit_{int(time.time() * 1000)}.pdf")
+        with open(updated_path, "wb") as f:
+            writer.write(f)
+        self.load_pdf(updated_path)
+
+    def apply_highlight_box(self, nx1, ny1, nx2, ny2):
+        def _draw(fpdf, pw, ph):
+            x = min(nx1, nx2) * pw
+            y = min(ny1, ny2) * ph
+            w = abs(nx2 - nx1) * pw
+            h = abs(ny2 - ny1) * ph
+            if w > 3 and h > 3:
+                with fpdf.local_context(fill_opacity=0.4):
+                    fpdf.set_fill_color(255, 235, 59)
+                    fpdf.rect(x, y, w, h, style="F")
+
+        self._merge_fpdf_overlay(_draw)
+        self.status_lbl.text = "Highlight added"
+
+    def apply_ink_strokes(self, norm_pts):
+        def _draw(fpdf, pw, ph):
+            fpdf.set_draw_color(220, 38, 38)
+            fpdf.set_line_width(2.0)
+            for i in range(1, len(norm_pts)):
+                x1, y1 = norm_pts[i - 1][0] * pw, norm_pts[i - 1][1] * ph
+                x2, y2 = norm_pts[i][0] * pw, norm_pts[i][1] * ph
+                fpdf.line(x1, y1, x2, y2)
+
+        self._merge_fpdf_overlay(_draw)
+        self.status_lbl.text = "Drawing added"
+
+    def prompt_add_text(self, nx, ny):
+        box = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        inp = TextInput(hint_text="Type text to insert...", multiline=False)
+        btn = Button(text="Insert Text", size_hint_y=None, height=44)
+        box.add_widget(inp)
+        box.add_widget(btn)
+        pop = Popup(title="Add Text", content=box, size_hint=(0.85, 0.32))
+
+        def _insert(*_):
+            txt = inp.text.strip()
+            pop.dismiss()
+            if txt:
+                def _draw(fpdf, pw, ph):
+                    fpdf.set_font("Helvetica", size=14)
+                    fpdf.set_text_color(15, 45, 180)
+                    fpdf.text(nx * pw, ny * ph, txt)
+
+                self._merge_fpdf_overlay(_draw)
+                self.status_lbl.text = "Text inserted"
+
+        btn.bind(on_release=_insert)
+        pop.open()
+
+    def open_signature_dialog(self):
+        box = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        pad = SignaturePad(size_hint_y=1)
+        row = BoxLayout(size_hint_y=None, height=44, spacing=8)
+        btn_clear = Button(text="Clear")
+        btn_use = Button(text="Use Signature", background_color=(0.15, 0.39, 0.92, 1))
+        row.add_widget(btn_clear)
+        row.add_widget(btn_use)
+        box.add_widget(pad)
+        box.add_widget(row)
+
+        pop = Popup(title="Draw Signature", content=box, size_hint=(0.9, 0.5))
+        btn_clear.bind(on_release=lambda *_: pad.clear_pad())
+
+        def _save_sig(*_):
+            sig_file = os.path.join(self.user_data_dir, "signature.png")
+            pad.export_to_png(sig_file)
+            self.sig_png_path = sig_file
+            pop.dismiss()
             self.set_mode("sign")
-            QMessageBox.information(self, "Place Signature", "Click anywhere on the page to stamp your signature.")
+            self.status_lbl.text = "Tap anywhere on the PDF to stamp signature"
 
-    def clear_annots(self):
-        if self.engine.doc:
-            self.engine.clear_page_annotations(self.current_page)
-            self.refresh_view()
+        btn_use.bind(on_release=_save_sig)
+        pop.open()
 
-    def save_file(self):
-        if self.engine.doc:
-            self.engine.save_pdf()
-            QMessageBox.information(self, "Saved", "PDF saved successfully.")
+    def apply_signature_at(self, nx, ny):
+        def _draw(fpdf, pw, ph):
+            fpdf.image(self.sig_png_path, x=nx * pw, y=ny * ph, w=130, h=55)
 
-    def save_file_as(self):
-        if not self.engine.doc:
+        self._merge_fpdf_overlay(_draw)
+        self.set_mode("pan")
+        self.status_lbl.text = "Signature stamped"
+
+    # -------------------- ORGANIZE, CONVERT, PROTECT, TTS --------------------
+
+    def rotate_page(self):
+        if not self.current_pdf:
             return
-        out, _ = QFileDialog.getSaveFileName(self, "Save PDF As", "", "PDF Files (*.pdf)")
-        if out:
-            self.engine.save_pdf(out)
-            QMessageBox.information(self, "Saved", f"Saved to {out}")
+        reader = PdfReader(self.current_pdf)
+        writer = PdfWriter()
+        for i, p in enumerate(reader.pages):
+            if i == self.current_page:
+                p.rotate(90)
+            writer.add_page(p)
+        out = os.path.join(self.user_data_dir, f"rot_{int(time.time() * 1000)}.pdf")
+        with open(out, "wb") as f:
+            writer.write(f)
+        self.load_pdf(out)
 
-    def rotate_current_page(self):
-        if self.engine.doc:
-            self.engine.rotate_page(self.current_page, 90)
-            self.populate_thumbnails()
-            self.refresh_view()
-
-    def move_current_page(self, offset: int):
-        if not self.engine.doc:
+    def delete_page(self):
+        if not self.current_pdf or self.total_pages <= 1:
             return
-        target = self.current_page + offset
-        if 0 <= target < len(self.engine.doc):
-            self.engine.move_page(self.current_page, target)
-            self.current_page = target
-            self.populate_thumbnails()
-            self.refresh_view()
+        reader = PdfReader(self.current_pdf)
+        writer = PdfWriter()
+        for i, p in enumerate(reader.pages):
+            if i != self.current_page:
+                writer.add_page(p)
+        out = os.path.join(self.user_data_dir, f"del_{int(time.time() * 1000)}.pdf")
+        with open(out, "wb") as f:
+            writer.write(f)
+        self.load_pdf(out)
 
-    def delete_current_page(self):
-        if self.engine.doc and len(self.engine.doc) > 1:
-            self.engine.delete_page(self.current_page)
-            self.populate_thumbnails()
-            self.refresh_view()
-
-    def merge_pdfs(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select PDFs to Merge", "", "PDF Files (*.pdf)")
-        if len(files) < 2:
+    def open_split_dialog(self):
+        if not self.current_pdf:
             return
-        out, _ = QFileDialog.getSaveFileName(self, "Save Merged PDF", "merged.pdf", "PDF Files (*.pdf)")
-        if out:
-            self.engine.merge_pdfs(files, out)
-            QMessageBox.information(self, "Merged", f"Merged {len(files)} PDFs into {out}")
+        box = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        from_in = TextInput(text="1", hint_text="From page", input_filter="int", multiline=False)
+        to_in = TextInput(text=str(self.total_pages), hint_text="To page", input_filter="int", multiline=False)
+        btn = Button(text="Extract Range", size_hint_y=None, height=44)
+        box.add_widget(from_in)
+        box.add_widget(to_in)
+        box.add_widget(btn)
+        pop = Popup(title="Split / Extract Pages", content=box, size_hint=(0.85, 0.4))
 
-    def split_pdf(self):
-        if not self.engine.doc:
-            return
-        dlg = SplitDialog(len(self.engine.doc), self)
-        if dlg.exec():
-            out, _ = QFileDialog.getSaveFileName(self, "Save Extracted PDF", "extracted.pdf", "PDF Files (*.pdf)")
-            if out:
-                self.engine.split_pdf(dlg.start_spin.value(), dlg.end_spin.value(), out)
-                QMessageBox.information(self, "Extracted", f"Saved extracted pages to {out}")
+        def _split(*_):
+            s = max(1, int(from_in.text or 1))
+            e = min(self.total_pages, int(to_in.text or self.total_pages))
+            pop.dismiss()
+            reader = PdfReader(self.current_pdf)
+            writer = PdfWriter()
+            for i in range(s - 1, e):
+                writer.add_page(reader.pages[i])
+            out = os.path.join(self.user_data_dir, f"split_{int(time.time() * 1000)}.pdf")
+            with open(out, "wb") as f:
+                writer.write(f)
+            self.current_page = 0
+            self.load_pdf(out)
+            self.status_lbl.text = f"Extracted pages {s}-{e}"
 
-    def export_word(self):
-        if not self.engine.doc:
-            return
-        out, _ = QFileDialog.getSaveFileName(self, "Convert PDF to Word", "converted.docx", "Word Document (*.docx)")
-        if out:
-            self.engine.pdf_to_word(out)
-            QMessageBox.information(self, "Converted", f"Exported Word file to {out}")
+        btn.bind(on_release=_split)
+        pop.open()
 
-    def export_images(self):
-        if not self.engine.doc:
+    def open_encrypt_dialog(self):
+        if not self.current_pdf:
             return
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder for PNGs")
-        if folder:
-            self.engine.pdf_to_images(folder)
-            QMessageBox.information(self, "Exported", f"All pages saved as PNG images in {folder}")
+        box = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        pw_in = TextInput(hint_text="Set password...", password=True, multiline=False)
+        btn = Button(text="Encrypt & Save to Downloads", size_hint_y=None, height=44)
+        box.add_widget(pw_in)
+        box.add_widget(btn)
+        pop = Popup(title="Password Protect PDF", content=box, size_hint=(0.85, 0.34))
 
-    def create_pdf_from_images(self):
-        imgs, _ = QFileDialog.getOpenFileNames(
-            self, "Select Images", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
-        )
-        if not imgs:
-            return
-        out, _ = QFileDialog.getSaveFileName(self, "Save Created PDF", "from_images.pdf", "PDF Files (*.pdf)")
-        if out:
-            self.engine.images_to_pdf(imgs, out)
-            QMessageBox.information(self, "Created", f"Created PDF at {out}")
+        def _lock(*_):
+            pw = pw_in.text.strip()
+            pop.dismiss()
+            if pw:
+                reader = PdfReader(self.current_pdf)
+                writer = PdfWriter()
+                for p in reader.pages:
+                    writer.add_page(p)
+                writer.encrypt(pw)
+                out = self._get_save_path("OpenAcrobat_Protected.pdf")
+                with open(out, "wb") as f:
+                    writer.write(f)
+                self.status_lbl.text = f"Saved protected PDF: {out}"
 
-    def compress_pdf(self):
-        if not self.engine.doc:
-            return
-        out, _ = QFileDialog.getSaveFileName(self, "Save Compressed PDF", "compressed.pdf", "PDF Files (*.pdf)")
-        if out:
-            self.engine.compress_pdf(out)
-            QMessageBox.information(self, "Compressed", f"Compressed PDF saved to {out}")
+        btn.bind(on_release=_lock)
+        pop.open()
 
-    def encrypt_pdf(self):
-        if not self.engine.doc:
+    def prompt_password_and_decrypt(self, path):
+        box = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        pw_in = TextInput(hint_text="Enter PDF password...", password=True, multiline=False)
+        btn = Button(text="Unlock", size_hint_y=None, height=44)
+        box.add_widget(pw_in)
+        box.add_widget(btn)
+        pop = Popup(title="Encrypted PDF", content=box, size_hint=(0.85, 0.34))
+
+        def _unlock(*_):
+            pop.dismiss()
+            reader = PdfReader(path)
+            if reader.decrypt(pw_in.text):
+                writer = PdfWriter()
+                for p in reader.pages:
+                    writer.add_page(p)
+                dec_path = os.path.join(self.user_data_dir, "unlocked.pdf")
+                with open(dec_path, "wb") as f:
+                    writer.write(f)
+                self.load_pdf(dec_path)
+            else:
+                self.status_lbl.text = "Incorrect password"
+
+        btn.bind(on_release=_unlock)
+        pop.open()
+
+    def open_search_dialog(self):
+        if not self.current_pdf:
             return
-        dlg = EncryptDialog(self)
-        if dlg.exec() and dlg.user_pw.text():
-            out, _ = QFileDialog.getSaveFileName(self, "Save Protected PDF", "protected.pdf", "PDF Files (*.pdf)")
-            if out:
-                self.engine.encrypt_pdf(out, dlg.user_pw.text(), dlg.owner_pw.text())
-                QMessageBox.information(self, "Protected", f"AES-256 encrypted PDF saved to {out}")
+        box = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        q_in = TextInput(hint_text="Search word...", multiline=False)
+        btn = Button(text="Find", size_hint_y=None, height=44)
+        box.add_widget(q_in)
+        box.add_widget(btn)
+        pop = Popup(title="Search PDF", content=box, size_hint=(0.85, 0.34))
+
+        def _find(*_):
+            q = q_in.text.strip().lower()
+            pop.dismiss()
+            if not q:
+                return
+            reader = PdfReader(self.current_pdf)
+            for idx, page in enumerate(reader.pages):
+                txt = (page.extract_text() or "").lower()
+                if q in txt:
+                    self.current_page = idx
+                    self.render_current_page()
+                    self.status_lbl.text = f"Found '{q}' on page {idx + 1}"
+                    return
+            self.status_lbl.text = "No matches found"
+
+        btn.bind(on_release=_find)
+        pop.open()
 
     def read_aloud(self):
-        if self.engine.doc:
-            self.engine.read_aloud(self.current_page)
-
-    def show_ocr_text(self):
-        if not self.engine.doc:
+        if not self.current_pdf:
             return
-        text = self.engine.extract_text_or_ocr(self.current_page)
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Extracted / OCR Text - Page {self.current_page + 1}")
-        dlg.resize(600, 450)
-        layout = QVBoxLayout(dlg)
-        box = QTextEdit()
-        box.setPlainText(text)
-        layout.addWidget(box)
-        dlg.exec()
+        reader = PdfReader(self.current_pdf)
+        text = (reader.pages[self.current_page].extract_text() or "").strip()
+        if not text:
+            self.status_lbl.text = "No selectable text on this page"
+            return
+        if platform == "android" and self.tts:
+            self.tts.setLanguage(Locale.US)
+            self.tts.speak(text[:3500], 0, None, "openacrobat_tts")
+            self.status_lbl.text = "Reading page aloud..."
+
+    # -------------------- ANDROID FILE PICKER & SAVING --------------------
+
+    def _launch_picker(self, mime_type, req_code, multiple=False):
+        if platform != "android":
+            self.status_lbl.text = "Android file picker works on Android devices"
+            return
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType(mime_type)
+        if multiple:
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
+        PythonActivity.mActivity.startActivityForResult(intent, req_code)
+
+    def pick_single_pdf(self):
+        self._launch_picker("application/pdf", REQ_OPEN_PDF, multiple=False)
+
+    def pick_merge_pdfs(self):
+        self._launch_picker("application/pdf", REQ_MERGE_PDFS, multiple=True)
+
+    def pick_images_to_pdf(self):
+        self._launch_picker("image/*", REQ_IMAGES_TO_PDF, multiple=True)
+
+    def _copy_uri_to_local(self, uri, filename):
+        resolver = PythonActivity.mActivity.getContentResolver()
+        stream = resolver.openInputStream(uri)
+        dest = os.path.join(self.user_data_dir, filename)
+        buf = bytearray(8192)
+        with open(dest, "wb") as out:
+            while True:
+                n = stream.read(buf)
+                if n == -1:
+                    break
+                out.write(buf[:n])
+        stream.close()
+        return dest
+
+    def on_activity_result(self, request_code, result_code, intent):
+        if result_code != -1 or intent is None:
+            return
+
+        uris = []
+        clip = intent.getClipData()
+        if clip is not None:
+            for i in range(clip.getItemCount()):
+                uris.append(clip.getItemAt(i).getUri())
+        elif intent.getData() is not None:
+            uris.append(intent.getData())
+
+        if not uris:
+            return
+
+        if request_code == REQ_OPEN_PDF:
+            local_pdf = self._copy_uri_to_local(uris[0], "opened.pdf")
+            Clock.schedule_once(lambda *_: self.load_pdf(local_pdf), 0)
+
+        elif request_code == REQ_MERGE_PDFS:
+            writer = PdfWriter()
+            for idx, u in enumerate(uris):
+                part = self._copy_uri_to_local(u, f"merge_{idx}.pdf")
+                reader = PdfReader(part)
+                for p in reader.pages:
+                    writer.add_page(p)
+            merged_out = os.path.join(self.user_data_dir, "merged.pdf")
+            with open(merged_out, "wb") as f:
+                writer.write(f)
+            Clock.schedule_once(lambda *_: self.load_pdf(merged_out), 0)
+
+        elif request_code == REQ_IMAGES_TO_PDF:
+            fpdf = FPDF()
+            for idx, u in enumerate(uris):
+                img_path = self._copy_uri_to_local(u, f"img_{idx}.png")
+                im = PILImage.open(img_path).convert("RGB")
+                clean_jpg = os.path.join(self.user_data_dir, f"clean_{idx}.jpg")
+                im.save(clean_jpg, "JPEG")
+                fpdf.add_page()
+                fpdf.image(clean_jpg, x=10, y=10, w=190)
+            out_pdf = os.path.join(self.user_data_dir, "from_images.pdf")
+            fpdf.output(out_pdf)
+            Clock.schedule_once(lambda *_: self.load_pdf(out_pdf), 0)
+
+    def _get_save_path(self, default_name):
+        if platform == "android":
+            dl_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+            if os.path.isdir(dl_dir):
+                return os.path.join(dl_dir, default_name)
+        return os.path.join(self.user_data_dir, default_name)
+
+    def save_to_downloads(self):
+        if not self.current_pdf:
+            return
+        dest = self._get_save_path(f"OpenAcrobat_{int(time.time())}.pdf")
+        with open(self.current_pdf, "rb") as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+        self.status_lbl.text = f"Saved: {dest}"
 
 
 if __name__ == "__main__":
-    if sys.platform == "win32":
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpenAcrobat.PDFReader.1.0")
-
-    app = QApplication(sys.argv)
-
-    icon_file = get_icon_path()
-    if os.path.exists(icon_file):
-        app.setWindowIcon(QIcon(icon_file))
-
-    window = OpenAcrobatWindow()
-    window.show()
-    sys.exit(app.exec())
+    OpenAcrobatApp().run()
