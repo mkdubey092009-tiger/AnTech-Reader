@@ -5,7 +5,7 @@ package.domain = org.antechreader
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 1.0
-requirements = python3,kivy==2.3.0,android,pyjnius,pillow,pypdf==3.17.4
+requirements = python3,kivy==2.3.0,pyjnius,pillow,pypdf==3.17.4
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/icon.png
 orientation = portrait
@@ -15,7 +15,7 @@ android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 android.api = 33
 android.minapi = 24
 android.ndk = 25b
-android.archs = arm64-v8a
+android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
 p4a.branch = v2024.01.21
 
