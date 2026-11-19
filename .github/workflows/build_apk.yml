@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build AnTech Reader APK
 
 on:
   push:
@@ -7,21 +7,36 @@ on:
 
 jobs:
   build-apk:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build APK with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-pip python3-venv python3-dev \
+            git zip unzip openjdk-17-jdk \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev
 
-      - name: Upload OpenAcrobat APK
+      - name: Set up Python environment and Buildozer
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip wheel
+          pip install "setuptools<70.0.0" "cython==0.29.36" buildozer
+
+      - name: Build AnTech Reader APK
+        run: |
+          source venv/bin/activate
+          yes | buildozer android debug
+
+      - name: Upload AnTech Reader APK
         uses: actions/upload-artifact@v4
         with:
-          name: OpenAcrobat-Android-APK
-          path: ${{ steps.buildozer.outputs.filename }}
+          name: AnTech-Reader-APK
+          path: bin/*.apk
