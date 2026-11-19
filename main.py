@@ -172,9 +172,9 @@ class PDFPageCanvas(Image):
         return True
 
 
-class OpenAcrobatApp(App):
+class AnTechReaderApp(App):
     def build(self):
-        self.title = "OpenAcrobat"
+        self.title = "AnTech Reader"
         self.icon = "icon.png"
         self.current_pdf = None
         self.current_page = 0
@@ -203,7 +203,7 @@ class OpenAcrobatApp(App):
         top_bar.add_widget(Button(text="Dark", on_release=lambda *_: self.toggle_dark_mode()))
         root.add_widget(top_bar)
 
-        # Scrollable Tool Strip (All Acrobat Features)
+        # Scrollable Tool Strip
         tool_scroll = ScrollView(size_hint_y=None, height=46, do_scroll_y=False)
         tool_bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=4)
         tool_bar.bind(minimum_width=tool_bar.setter("width"))
@@ -240,7 +240,7 @@ class OpenAcrobatApp(App):
         root.add_widget(self.viewer_scroll)
 
         # Status Bar
-        self.status_lbl = Label(text="Ready - Tap Open to load any PDF", size_hint_y=None, height=28, font_size="12sp")
+        self.status_lbl = Label(text="AnTech Reader - Tap Open to load any PDF", size_hint_y=None, height=28, font_size="12sp")
         root.add_widget(self.status_lbl)
 
         Clock.schedule_once(lambda *_: self._create_welcome_pdf(), 0.2)
@@ -252,19 +252,18 @@ class OpenAcrobatApp(App):
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 22)
-        pdf.cell(0, 16, "OpenAcrobat for Android", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 16, "AnTech Reader", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", size=13)
         pdf.multi_cell(
             0,
             9,
+            "Welcome to AnTech Reader!\n"
             "Tap 'Open' at the top-left to load any PDF from your phone.\n"
             "You can Highlight, Add Text, Draw, Fill & Sign, Rotate, Merge, Split, "
             "Convert Images to PDF, Password Protect, and Read Aloud!",
         )
         pdf.output(sample_path)
         self.load_pdf(sample_path)
-
-    # -------------------- RENDERING --------------------
 
     def load_pdf(self, path):
         try:
@@ -335,8 +334,6 @@ class OpenAcrobatApp(App):
     def set_mode(self, mode):
         self.tool_mode = mode
         self.status_lbl.text = f"Active tool: {mode.upper()}"
-
-    # -------------------- ANNOTATIONS & SIGNING --------------------
 
     def _merge_fpdf_overlay(self, draw_callback):
         if not self.current_pdf:
@@ -445,8 +442,6 @@ class OpenAcrobatApp(App):
         self.set_mode("pan")
         self.status_lbl.text = "Signature stamped"
 
-    # -------------------- ORGANIZE, CONVERT, PROTECT, TTS --------------------
-
     def rotate_page(self):
         if not self.current_pdf:
             return
@@ -523,7 +518,7 @@ class OpenAcrobatApp(App):
                 for p in reader.pages:
                     writer.add_page(p)
                 writer.encrypt(pw)
-                out = self._get_save_path("OpenAcrobat_Protected.pdf")
+                out = self._get_save_path("AnTech_Reader_Protected.pdf")
                 with open(out, "wb") as f:
                     writer.write(f)
                 self.status_lbl.text = f"Saved protected PDF: {out}"
@@ -594,10 +589,8 @@ class OpenAcrobatApp(App):
             return
         if platform == "android" and self.tts:
             self.tts.setLanguage(Locale.US)
-            self.tts.speak(text[:3500], 0, None, "openacrobat_tts")
+            self.tts.speak(text[:3500], 0, None, "antech_reader_tts")
             self.status_lbl.text = "Reading page aloud..."
-
-    # -------------------- ANDROID FILE PICKER & SAVING --------------------
 
     def _launch_picker(self, mime_type, req_code, multiple=False):
         if platform != "android":
@@ -687,11 +680,11 @@ class OpenAcrobatApp(App):
     def save_to_downloads(self):
         if not self.current_pdf:
             return
-        dest = self._get_save_path(f"OpenAcrobat_{int(time.time())}.pdf")
+        dest = self._get_save_path(f"AnTech_Reader_{int(time.time())}.pdf")
         with open(self.current_pdf, "rb") as src, open(dest, "wb") as dst:
             dst.write(src.read())
         self.status_lbl.text = f"Saved: {dest}"
 
 
 if __name__ == "__main__":
-    OpenAcrobatApp().run()
+    AnTechReaderApp().run()
