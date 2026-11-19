@@ -1,9 +1,16 @@
 import io
 import os
 import time
+import traceback
 from PIL import Image as PILImage
-from fpdf import FPDF
-from pypdf import PdfReader, PdfWriter
+
+try:
+    from pypdf import PdfReader, PdfWriter
+    PYPDF_OK = True
+    PYPDF_ERR = ""
+except Exception as _imp_err:
+    PYPDF_OK = False
+    PYPDF_ERR = traceback.format_exc()
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -32,11 +39,18 @@ if platform == "android":
     PythonActivity = autoclass("org.kivy.android.PythonActivity")
     Intent = autoclass("android.content.Intent")
     File = autoclass("java.io.File")
+    FileOutputStream = autoclass("java.io.FileOutputStream")
     ParcelFileDescriptor = autoclass("android.os.ParcelFileDescriptor")
     PdfRenderer = autoclass("android.graphics.pdf.PdfRenderer")
+    PdfDocument = autoclass("android.graphics.pdf.PdfDocument")
+    PageInfoBuilder = autoclass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
     Bitmap = autoclass("android.graphics.Bitmap")
     BitmapConfig = autoclass("android.graphics.Bitmap$Config")
+    BitmapFactory = autoclass("android.graphics.BitmapFactory")
     Canvas = autoclass("android.graphics.Canvas")
+    Paint = autoclass("android.graphics.Paint")
+    PaintStyle = autoclass("android.graphics.Paint$Style")
+    RectF = autoclass("android.graphics.RectF")
     AndroidColor = autoclass("android.graphics.Color")
     ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
     CompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
@@ -185,85 +199,131 @@ class AnTechReaderApp(App):
         self.sig_png_path = None
         self.tts = None
 
-        if platform == "android":
-            request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
-            activity.bind(on_activity_result=self.on_activity_result)
-            self.tts = TextToSpeech(PythonActivity.mActivity, None)
+        if not PYPDF_OK:
+            return self._build_error_screen(f"PDF Library Error:\n{PYPDF_ERR}")
 
-        root = BoxLayout(orientation="vertical", spacing=4, padding=6)
+        try:
+            if platform == "android":
+                try:
+                    request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
+                except Exception:
+                    pass
+                try:
+                    activity.bind(on_activity_result=self.on_activity_result)
+                except Exception:
+                    pass
+                try:
+                    self.tts = TextToSpeech(PythonActivity.mActivity, None)
+                except Exception:
+                    self.tts = None
 
-        # Top Action Bar
-        top_bar = GridLayout(cols=6, size_hint_y=None, height=46, spacing=4)
-        top_bar.add_widget(Button(text="Open", background_color=(0.15, 0.39, 0.92, 1), on_release=lambda *_: self.pick_single_pdf()))
-        top_bar.add_widget(Button(text="Save", on_release=lambda *_: self.save_to_downloads()))
-        top_bar.add_widget(Button(text="Prev", on_release=lambda *_: self.change_page(-1)))
-        self.page_lbl = Label(text="1 / 1", size_hint_x=0.8)
-        top_bar.add_widget(self.page_lbl)
-        top_bar.add_widget(Button(text="Next", on_release=lambda *_: self.change_page(1)))
-        top_bar.add_widget(Button(text="Dark", on_release=lambda *_: self.toggle_dark_mode()))
-        root.add_widget(top_bar)
+            root = BoxLayout(orientation="vertical", spacing=4, padding=6)
 
-        # Scrollable Tool Strip
-        tool_scroll = ScrollView(size_hint_y=None, height=46, do_scroll_y=False)
-        tool_bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=4)
-        tool_bar.bind(minimum_width=tool_bar.setter("width"))
+            # Top Action Bar
+            top_bar = GridLayout(cols=6, size_hint_y=None, height=46, spacing=4)
+            top_bar.add_widget(Button(text="Open", background_color=(0.15, 0.39, 0.92, 1), on_release=lambda *_: self.pick_single_pdf()))
+            top_bar.add_widget(Button(text="Save", on_release=lambda *_: self.save_to_downloads()))
+            top_bar.add_widget(Button(text="Prev", on_release=lambda *_: self.change_page(-1)))
+            self.page_lbl = Label(text="1 / 1", size_hint_x=0.8)
+            top_bar.add_widget(self.page_lbl)
+            top_bar.add_widget(Button(text="Next", on_release=lambda *_: self.change_page(1)))
+            top_bar.add_widget(Button(text="Dark", on_release=lambda *_: self.toggle_dark_mode()))
+            root.add_widget(top_bar)
 
-        tools = [
-            ("Pan", lambda *_: self.set_mode("pan")),
-            ("Highlight", lambda *_: self.set_mode("highlight")),
-            ("Add Text", lambda *_: self.set_mode("text")),
-            ("Draw", lambda *_: self.set_mode("draw")),
-            ("Fill & Sign", lambda *_: self.open_signature_dialog()),
-            ("Zoom +", lambda *_: self.change_zoom(0.3)),
-            ("Zoom -", lambda *_: self.change_zoom(-0.3)),
-            ("Rotate 90°", lambda *_: self.rotate_page()),
-            ("Delete Pg", lambda *_: self.delete_page()),
-            ("Merge PDFs", lambda *_: self.pick_merge_pdfs()),
-            ("Split PDF", lambda *_: self.open_split_dialog()),
-            ("Img -> PDF", lambda *_: self.pick_images_to_pdf()),
-            ("Protect", lambda *_: self.open_encrypt_dialog()),
-            ("Read Aloud", lambda *_: self.read_aloud()),
-            ("Search", lambda *_: self.open_search_dialog()),
-        ]
-        for label, cb in tools:
-            btn = Button(text=label, size_hint_x=None, width=96)
-            btn.bind(on_release=cb)
-            tool_bar.add_widget(btn)
+            # Scrollable Tool Strip
+            tool_scroll = ScrollView(size_hint_y=None, height=46, do_scroll_y=False)
+            tool_bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=4)
+            tool_bar.bind(minimum_width=tool_bar.setter("width"))
 
-        tool_scroll.add_widget(tool_bar)
-        root.add_widget(tool_scroll)
+            tools = [
+                ("Pan", lambda *_: self.set_mode("pan")),
+                ("Highlight", lambda *_: self.set_mode("highlight")),
+                ("Add Text", lambda *_: self.set_mode("text")),
+                ("Draw", lambda *_: self.set_mode("draw")),
+                ("Fill & Sign", lambda *_: self.open_signature_dialog()),
+                ("Zoom +", lambda *_: self.change_zoom(0.3)),
+                ("Zoom -", lambda *_: self.change_zoom(-0.3)),
+                ("Rotate 90", lambda *_: self.rotate_page()),
+                ("Delete Pg", lambda *_: self.delete_page()),
+                ("Merge PDFs", lambda *_: self.pick_merge_pdfs()),
+                ("Split PDF", lambda *_: self.open_split_dialog()),
+                ("Img -> PDF", lambda *_: self.pick_images_to_pdf()),
+                ("Protect", lambda *_: self.open_encrypt_dialog()),
+                ("Read Aloud", lambda *_: self.read_aloud()),
+                ("Search", lambda *_: self.open_search_dialog()),
+            ]
+            for label, cb in tools:
+                btn = Button(text=label, size_hint_x=None, width=96)
+                btn.bind(on_release=cb)
+                tool_bar.add_widget(btn)
 
-        # Center PDF Viewport
-        self.viewer_scroll = ScrollView()
-        self.pdf_view = PDFPageCanvas(self, size_hint=(None, None))
-        self.viewer_scroll.add_widget(self.pdf_view)
-        root.add_widget(self.viewer_scroll)
+            tool_scroll.add_widget(tool_bar)
+            root.add_widget(tool_scroll)
 
-        # Status Bar
-        self.status_lbl = Label(text="AnTech Reader - Tap Open to load any PDF", size_hint_y=None, height=28, font_size="12sp")
-        root.add_widget(self.status_lbl)
+            # Center PDF Viewport
+            self.viewer_scroll = ScrollView()
+            self.pdf_view = PDFPageCanvas(self, size_hint=(None, None))
+            self.viewer_scroll.add_widget(self.pdf_view)
+            root.add_widget(self.viewer_scroll)
 
-        Clock.schedule_once(lambda *_: self._create_welcome_pdf(), 0.2)
-        return root
+            # Status Bar
+            self.status_lbl = Label(text="AnTech Reader - Tap Open to load any PDF", size_hint_y=None, height=28, font_size="12sp")
+            root.add_widget(self.status_lbl)
+
+            Clock.schedule_once(lambda *_: self._create_welcome_pdf(), 0.3)
+            return root
+        except Exception:
+            return self._build_error_screen(traceback.format_exc())
+
+    def _build_error_screen(self, err_text):
+        box = BoxLayout(orientation="vertical", padding=12, spacing=8)
+        box.add_widget(Label(text="Startup Error Details:", size_hint_y=None, height=32))
+        ti = TextInput(text=err_text, readonly=True)
+        box.add_widget(ti)
+        return box
 
     def _create_welcome_pdf(self):
-        os.makedirs(self.user_data_dir, exist_ok=True)
-        sample_path = os.path.join(self.user_data_dir, "welcome.pdf")
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 22)
-        pdf.cell(0, 16, "AnTech Reader", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", size=13)
-        pdf.multi_cell(
-            0,
-            9,
-            "Welcome to AnTech Reader!\n"
-            "Tap 'Open' at the top-left to load any PDF from your phone.\n"
-            "You can Highlight, Add Text, Draw, Fill & Sign, Rotate, Merge, Split, "
-            "Convert Images to PDF, Password Protect, and Read Aloud!",
-        )
-        pdf.output(sample_path)
-        self.load_pdf(sample_path)
+        try:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            sample_path = os.path.join(self.user_data_dir, "welcome.pdf")
+            if platform == "android":
+                doc = PdfDocument()
+                page_info = PageInfoBuilder(595, 842, 1).create()
+                page = doc.startPage(page_info)
+                canvas = page.getCanvas()
+                canvas.drawColor(AndroidColor.WHITE)
+
+                title_paint = Paint()
+                title_paint.setColor(AndroidColor.rgb(37, 99, 235))
+                title_paint.setTextSize(28.0)
+                title_paint.setAntiAlias(True)
+                canvas.drawText("AnTech Reader", 45.0, 80.0, title_paint)
+
+                body_paint = Paint()
+                body_paint.setColor(AndroidColor.rgb(30, 41, 59))
+                body_paint.setTextSize(15.0)
+                body_paint.setAntiAlias(True)
+                lines = [
+                    "Welcome to AnTech Reader!",
+                    "1. Tap 'Open' at top-left to load any PDF from your phone.",
+                    "2. Swipe the toolbar to Highlight, Add Text, Draw, or Fill & Sign.",
+                    "3. Rotate, Delete, Merge, Split, Protect, or Read Aloud any PDF.",
+                ]
+                y = 130.0
+                for line in lines:
+                    canvas.drawText(line, 45.0, y, body_paint)
+                    y += 30.0
+
+                doc.finishPage(page)
+                fos = FileOutputStream(sample_path)
+                doc.writeTo(fos)
+                fos.close()
+                doc.close()
+                self.load_pdf(sample_path)
+        except Exception as e:
+            self.status_lbl.text = f"Ready (Tap Open to select PDF): {e}"
+
+    # -------------------- RENDERING --------------------
 
     def load_pdf(self, path):
         try:
@@ -284,34 +344,37 @@ class AnTechReaderApp(App):
         self.page_lbl.text = f"{self.current_page + 1} / {self.total_pages}"
 
         if platform == "android":
-            java_file = File(self.current_pdf)
-            pfd = ParcelFileDescriptor.open(java_file, ParcelFileDescriptor.MODE_READ_ONLY)
-            renderer = PdfRenderer(pfd)
-            page = renderer.openPage(self.current_page)
-            w = max(200, int(page.getWidth() * self.zoom))
-            h = max(200, int(page.getHeight() * self.zoom))
-            bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
-            canvas = Canvas(bitmap)
-            canvas.drawColor(AndroidColor.WHITE)
-            page.render(bitmap, None, None, 1)
-            page.close()
-            renderer.close()
-            pfd.close()
+            try:
+                java_file = File(self.current_pdf)
+                pfd = ParcelFileDescriptor.open(java_file, ParcelFileDescriptor.MODE_READ_ONLY)
+                renderer = PdfRenderer(pfd)
+                page = renderer.openPage(self.current_page)
+                w = max(200, int(page.getWidth() * self.zoom))
+                h = max(200, int(page.getHeight() * self.zoom))
+                bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
+                canvas = Canvas(bitmap)
+                canvas.drawColor(AndroidColor.WHITE)
+                page.render(bitmap, None, None, 1)
+                page.close()
+                renderer.close()
+                pfd.close()
 
-            baos = ByteArrayOutputStream()
-            bitmap.compress(CompressFormat.PNG, 100, baos)
-            png_bytes = bytes(b & 0xFF for b in baos.toByteArray())
+                baos = ByteArrayOutputStream()
+                bitmap.compress(CompressFormat.PNG, 100, baos)
+                png_bytes = bytes(b & 0xFF for b in baos.toByteArray())
 
-            if self.dark_mode:
-                im = PILImage.open(io.BytesIO(png_bytes)).convert("RGB")
-                im = PILImage.eval(im, lambda px: 255 - px)
-                out_buf = io.BytesIO()
-                im.save(out_buf, format="PNG")
-                png_bytes = out_buf.getvalue()
+                if self.dark_mode:
+                    im = PILImage.open(io.BytesIO(png_bytes)).convert("RGB")
+                    im = PILImage.eval(im, lambda px: 255 - px)
+                    out_buf = io.BytesIO()
+                    im.save(out_buf, format="PNG")
+                    png_bytes = out_buf.getvalue()
 
-            tex = CoreImage(io.BytesIO(png_bytes), ext="png").texture
-            self.pdf_view.texture = tex
-            self.pdf_view.size = (w, h)
+                tex = CoreImage(io.BytesIO(png_bytes), ext="png").texture
+                self.pdf_view.texture = tex
+                self.pdf_view.size = (w, h)
+            except Exception as e:
+                self.status_lbl.text = f"Render error: {e}"
         else:
             self.pdf_view.size = (600, 800)
 
@@ -335,55 +398,68 @@ class AnTechReaderApp(App):
         self.tool_mode = mode
         self.status_lbl.text = f"Active tool: {mode.upper()}"
 
-    def _merge_fpdf_overlay(self, draw_callback):
-        if not self.current_pdf:
+    # -------------------- NATIVE ANDROID ANNOTATIONS & SIGNING --------------------
+
+    def _merge_native_overlay(self, draw_callback):
+        if not self.current_pdf or platform != "android":
             return
-        reader = PdfReader(self.current_pdf)
-        page = reader.pages[self.current_page]
-        pw, ph = float(page.mediabox.width), float(page.mediabox.height)
+        try:
+            reader = PdfReader(self.current_pdf)
+            page = reader.pages[self.current_page]
+            pw = max(100, int(float(page.mediabox.width)))
+            ph = max(100, int(float(page.mediabox.height)))
 
-        overlay_pdf = os.path.join(self.user_data_dir, "overlay.pdf")
-        fpdf = FPDF(unit="pt", format=(pw, ph))
-        fpdf.add_page()
-        draw_callback(fpdf, pw, ph)
-        fpdf.output(overlay_pdf)
+            overlay_pdf = os.path.join(self.user_data_dir, "overlay.pdf")
+            doc = PdfDocument()
+            page_info = PageInfoBuilder(pw, ph, 1).create()
+            pdf_page = doc.startPage(page_info)
+            canvas = pdf_page.getCanvas()
+            draw_callback(canvas, float(pw), float(ph))
+            doc.finishPage(pdf_page)
+            fos = FileOutputStream(overlay_pdf)
+            doc.writeTo(fos)
+            fos.close()
+            doc.close()
 
-        overlay_reader = PdfReader(overlay_pdf)
-        writer = PdfWriter()
-        for idx, p in enumerate(reader.pages):
-            if idx == self.current_page:
-                p.merge_page(overlay_reader.pages[0])
-            writer.add_page(p)
+            overlay_reader = PdfReader(overlay_pdf)
+            writer = PdfWriter()
+            for idx, p in enumerate(reader.pages):
+                if idx == self.current_page:
+                    p.merge_page(overlay_reader.pages[0])
+                writer.add_page(p)
 
-        updated_path = os.path.join(self.user_data_dir, f"edit_{int(time.time() * 1000)}.pdf")
-        with open(updated_path, "wb") as f:
-            writer.write(f)
-        self.load_pdf(updated_path)
+            updated_path = os.path.join(self.user_data_dir, f"edit_{int(time.time() * 1000)}.pdf")
+            with open(updated_path, "wb") as f:
+                writer.write(f)
+            self.load_pdf(updated_path)
+        except Exception as e:
+            self.status_lbl.text = f"Edit error: {e}"
 
     def apply_highlight_box(self, nx1, ny1, nx2, ny2):
-        def _draw(fpdf, pw, ph):
-            x = min(nx1, nx2) * pw
-            y = min(ny1, ny2) * ph
-            w = abs(nx2 - nx1) * pw
-            h = abs(ny2 - ny1) * ph
-            if w > 3 and h > 3:
-                with fpdf.local_context(fill_opacity=0.4):
-                    fpdf.set_fill_color(255, 235, 59)
-                    fpdf.rect(x, y, w, h, style="F")
+        def _draw(canvas, pw, ph):
+            x0, x1 = sorted([nx1 * pw, nx2 * pw])
+            y0, y1 = sorted([ny1 * ph, ny2 * ph])
+            if (x1 - x0) > 3 and (y1 - y0) > 3:
+                paint = Paint()
+                paint.setColor(AndroidColor.argb(115, 255, 235, 59))
+                paint.setStyle(PaintStyle.FILL)
+                canvas.drawRect(float(x0), float(y0), float(x1), float(y1), paint)
 
-        self._merge_fpdf_overlay(_draw)
+        self._merge_native_overlay(_draw)
         self.status_lbl.text = "Highlight added"
 
     def apply_ink_strokes(self, norm_pts):
-        def _draw(fpdf, pw, ph):
-            fpdf.set_draw_color(220, 38, 38)
-            fpdf.set_line_width(2.0)
+        def _draw(canvas, pw, ph):
+            paint = Paint()
+            paint.setColor(AndroidColor.rgb(220, 38, 38))
+            paint.setStrokeWidth(2.5)
+            paint.setAntiAlias(True)
             for i in range(1, len(norm_pts)):
                 x1, y1 = norm_pts[i - 1][0] * pw, norm_pts[i - 1][1] * ph
                 x2, y2 = norm_pts[i][0] * pw, norm_pts[i][1] * ph
-                fpdf.line(x1, y1, x2, y2)
+                canvas.drawLine(float(x1), float(y1), float(x2), float(y2), paint)
 
-        self._merge_fpdf_overlay(_draw)
+        self._merge_native_overlay(_draw)
         self.status_lbl.text = "Drawing added"
 
     def prompt_add_text(self, nx, ny):
@@ -398,12 +474,14 @@ class AnTechReaderApp(App):
             txt = inp.text.strip()
             pop.dismiss()
             if txt:
-                def _draw(fpdf, pw, ph):
-                    fpdf.set_font("Helvetica", size=14)
-                    fpdf.set_text_color(15, 45, 180)
-                    fpdf.text(nx * pw, ny * ph, txt)
+                def _draw(canvas, pw, ph):
+                    paint = Paint()
+                    paint.setColor(AndroidColor.rgb(15, 45, 180))
+                    paint.setTextSize(16.0)
+                    paint.setAntiAlias(True)
+                    canvas.drawText(txt, float(nx * pw), float(ny * ph), paint)
 
-                self._merge_fpdf_overlay(_draw)
+                self._merge_native_overlay(_draw)
                 self.status_lbl.text = "Text inserted"
 
         btn.bind(on_release=_insert)
@@ -435,12 +513,19 @@ class AnTechReaderApp(App):
         pop.open()
 
     def apply_signature_at(self, nx, ny):
-        def _draw(fpdf, pw, ph):
-            fpdf.image(self.sig_png_path, x=nx * pw, y=ny * ph, w=130, h=55)
+        def _draw(canvas, pw, ph):
+            bmp = BitmapFactory.decodeFile(self.sig_png_path)
+            if bmp is not None:
+                x = float(nx * pw)
+                y = float(ny * ph)
+                dest = RectF(x, y, x + 130.0, y + 55.0)
+                canvas.drawBitmap(bmp, None, dest, None)
 
-        self._merge_fpdf_overlay(_draw)
+        self._merge_native_overlay(_draw)
         self.set_mode("pan")
         self.status_lbl.text = "Signature stamped"
+
+    # -------------------- ORGANIZE, PROTECT, SEARCH, TTS --------------------
 
     def rotate_page(self):
         if not self.current_pdf:
@@ -588,9 +673,14 @@ class AnTechReaderApp(App):
             self.status_lbl.text = "No selectable text on this page"
             return
         if platform == "android" and self.tts:
-            self.tts.setLanguage(Locale.US)
-            self.tts.speak(text[:3500], 0, None, "antech_reader_tts")
-            self.status_lbl.text = "Reading page aloud..."
+            try:
+                self.tts.setLanguage(Locale.US)
+                self.tts.speak(text[:3500], 0, None, "antech_reader_tts")
+                self.status_lbl.text = "Reading page aloud..."
+            except Exception as e:
+                self.status_lbl.text = f"TTS error: {e}"
+
+    # -------------------- ANDROID FILE PICKER & SAVING --------------------
 
     def _launch_picker(self, mime_type, req_code, multiple=False):
         if platform != "android":
@@ -658,16 +748,21 @@ class AnTechReaderApp(App):
             Clock.schedule_once(lambda *_: self.load_pdf(merged_out), 0)
 
         elif request_code == REQ_IMAGES_TO_PDF:
-            fpdf = FPDF()
+            doc = PdfDocument()
             for idx, u in enumerate(uris):
                 img_path = self._copy_uri_to_local(u, f"img_{idx}.png")
-                im = PILImage.open(img_path).convert("RGB")
-                clean_jpg = os.path.join(self.user_data_dir, f"clean_{idx}.jpg")
-                im.save(clean_jpg, "JPEG")
-                fpdf.add_page()
-                fpdf.image(clean_jpg, x=10, y=10, w=190)
+                bmp = BitmapFactory.decodeFile(img_path)
+                if bmp is not None:
+                    w, h = bmp.getWidth(), bmp.getHeight()
+                    p_info = PageInfoBuilder(w, h, idx + 1).create()
+                    p = doc.startPage(p_info)
+                    p.getCanvas().drawBitmap(bmp, 0.0, 0.0, None)
+                    doc.finishPage(p)
             out_pdf = os.path.join(self.user_data_dir, "from_images.pdf")
-            fpdf.output(out_pdf)
+            fos = FileOutputStream(out_pdf)
+            doc.writeTo(fos)
+            fos.close()
+            doc.close()
             Clock.schedule_once(lambda *_: self.load_pdf(out_pdf), 0)
 
     def _get_save_path(self, default_name):
